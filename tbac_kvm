@@ -1,0 +1,224 @@
+#!/bin/bash
+
+# Check if the script is being run with sudo privileges
+if [ "$EUID" -ne 0 ]; then
+    echo "This script requires sudo privileges to use virsh commands and access VM files."
+    echo "Re-running the script with sudo..."
+    exec sudo "$0" "$@"
+    exit $?
+fi
+
+set -e  # Exit immediately if a command exits with a non-zero status.
+
+# Define colors for output
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+RED='\033[0;31m'
+NC='\033[0m'  # No Color
+
+# Get the actual user's home directory
+if [ -n "$SUDO_USER" ]; then
+    USER_HOME=$(getent passwd $SUDO_USER | cut -d: -f6)
+else
+    USER_HOME=$HOME
+fi
+
+# Configuration
+CONFIG_DIR="$USER_HOME/.config/tbac"
+ENV_FILE="$CONFIG_DIR/tbac_vm.env"
+KEYFILE="$CONFIG_DIR/static.key"
+
+# Ensure configuration directory exists
+mkdir -p "$CONFIG_DIR"
+
+# Function to check and install dependencies
+check_dependencies() {
+    local dependencies=("zstd" "tar" "gpg" "virsh")
+    for dep in "${dependencies[@]}"; do
+        if ! command -v "$dep" &> /dev/null; then
+            echo -e "${RED}$dep is not installed. Please install it and try again.${NC}"
+            exit 1
+        fi
+    done
+}
+
+# Function to load or create configuration
+load_or_create_config() {
+    if [ -f "$ENV_FILE" ]; then
+        source "$ENV_FILE"
+    fi
+
+    # Check and prompt for KVM_VM_DIR
+    if [ -z "$KVM_VM_DIR" ]; then
+        read -p "Enter the directory for KVM VMs (default: /var/lib/libvirt/images): " KVM_VM_DIR
+        KVM_VM_DIR=${KVM_VM_DIR:-/var/lib/libvirt/images}
+        echo "KVM_VM_DIR=\"$KVM_VM_DIR\"" >> "$ENV_FILE"
+    fi
+
+    # Check and prompt for BACKUP_DIR
+    if [ -z "$BACKUP_DIR" ]; then
+        read -p "Enter the directory for VM backups (default: $USER_HOME/VM_Backups): " BACKUP_DIR
+        BACKUP_DIR=${BACKUP_DIR:-$USER_HOME/VM_Backups}
+        echo "BACKUP_DIR=\"$BACKUP_DIR\"" >> "$ENV_FILE"
+    fi
+
+    # Ensure backup directory exists
+    mkdir -p "$BACKUP_DIR"
+}
+
+# Function to generate password file
+generate_password_file() {
+    if [ ! -f "$KEYFILE" ]; then
+        head -c 32 /dev/urandom | base64 | tr -d '/+=' > "$KEYFILE"
+        chmod 600 "$KEYFILE"
+        echo -e "${GREEN}Password file generated at '$KEYFILE'.${NC}"
+    fi
+}
+
+# Function to get list of KVM VMs
+get_kvm_vms() {
+    virsh list --all --name | grep -v "^$"
+}
+
+# Function to backup a single VM
+backup_vm() {
+    local vm_name="$1"
+    local timestamp=$(date +%Y%m%d_%H%M%S)
+    local output_file="${BACKUP_DIR}/${vm_name}_${timestamp}.tar.zst.gpg"
+    local key_file="${output_file}.key"
+
+    echo -e "${YELLOW}Backing up $vm_name...${NC}"
+
+    # Get the list of disk images for this VM, ignoring empty optical disks
+    local disk_images=$(virsh domblklist "$vm_name" | awk 'NR>2 && $2!="--" && $2!="-" {print $2}')
+    if [ -z "$disk_images" ]; then
+        echo -e "${RED}No disk images found for $vm_name. Skipping.${NC}"
+        return 1
+    fi
+
+    echo "Found disk images:"
+    echo "$disk_images"
+
+    # Dump XML configuration
+    echo "Dumping XML configuration..."
+    virsh dumpxml "$vm_name" > "${BACKUP_DIR}/${vm_name}.xml"
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}Failed to dump XML for $vm_name. Skipping.${NC}"
+        return 1
+    fi
+
+    # Create a temporary directory for this VM's files
+    local temp_dir=$(mktemp -d)
+    cp "${BACKUP_DIR}/${vm_name}.xml" "$temp_dir/"
+
+    # Copy disk images to temporary directory
+    while IFS= read -r disk; do
+        if [ -f "$disk" ]; then
+            echo "Copying disk: $disk"
+            cp "$disk" "$temp_dir/"
+        else
+            echo -e "${RED}Disk image $disk not found. Skipping this disk.${NC}"
+        fi
+    done <<< "$disk_images"
+
+    # Create the backup archive
+    echo "Creating backup archive..."
+    tar -C "$temp_dir" -cf - . | zstd -c | gpg --passphrase-file "$KEYFILE" --batch --yes -c --pinentry-mode loopback > "$output_file"
+
+    # Clean up
+    rm -rf "$temp_dir" "${BACKUP_DIR}/${vm_name}.xml"
+
+    if [ $? -eq 0 ]; then
+        echo -e "${GREEN}Backup of $vm_name completed: $output_file${NC}"
+        # Copy the key file
+        cp "$KEYFILE" "$key_file"
+        echo -e "${GREEN}Key file copied to: $key_file${NC}"
+    else
+        echo -e "${RED}Backup of $vm_name failed${NC}"
+        rm -f "$output_file"
+    fi
+}
+
+# Function to restore a VM
+restore_vm() {
+    local backup_file="$1"
+    local vm_name=$(basename "$backup_file" | cut -d '_' -f 1)
+    local restore_dir="${BACKUP_DIR}/${vm_name}_restored"
+    local key_file="${backup_file}.key"
+
+    echo -e "${YELLOW}Restoring $vm_name...${NC}"
+
+    if [ ! -f "$key_file" ]; then
+        echo -e "${RED}Key file not found: $key_file${NC}"
+        echo "Please ensure the key file is present with the same name as the backup file, but with a .key extension."
+        return 1
+    fi
+
+    mkdir -p "$restore_dir"
+    gpg --passphrase-file "$key_file" --batch --yes -d "$backup_file" | zstd -d | tar -xf - -C "$restore_dir"
+
+    if [ -f "${restore_dir}/${vm_name}.xml" ]; then
+        echo "Detected KVM/QEMU VM."
+        echo "XML file: ${restore_dir}/${vm_name}.xml"
+        echo "Disk images are in ${restore_dir}"
+        echo "Suggested restore steps:"
+        echo "1. Copy disk images to $KVM_VM_DIR"
+        echo "2. Update disk image paths in the XML file if necessary"
+        echo "3. Run: virsh define ${restore_dir}/${vm_name}.xml"
+    else
+        echo -e "${RED}Unable to find VM XML file. Please check the restored files in $restore_dir${NC}"
+    fi
+
+    echo -e "${GREEN}VM restored to $restore_dir${NC}"
+}
+
+# Function to backup all VMs
+backup_all_vms() {
+    generate_password_file
+
+    echo -e "${YELLOW}Backing up KVM/QEMU VMs...${NC}"
+    local vms=$(get_kvm_vms)
+    if [ -z "$vms" ]; then
+        echo -e "${RED}No VMs found to backup.${NC}"
+        return 1
+    fi
+    echo "Found VMs: $vms"
+    for vm in $vms; do
+        backup_vm "$vm"
+    done
+}
+
+# Function to list all VMs
+list_all_vms() {
+    echo -e "${YELLOW}KVM/QEMU VMs:${NC}"
+    get_kvm_vms | sed 's/^/  /'
+}
+
+# Main execution
+main() {
+    check_dependencies
+    load_or_create_config
+
+    case "$1" in
+        backup)
+            backup_all_vms
+            ;;
+        restore)
+            if [ -z "$2" ]; then
+                echo "Usage: $0 restore <backup_file>"
+                exit 1
+            fi
+            restore_vm "$2"
+            ;;
+        list)
+            list_all_vms
+            ;;
+        *)
+            echo "Usage: $0 {backup|restore <backup_file>|list}"
+            exit 1
+            ;;
+    esac
+}
+
+# Call the main function to execute the script
+main "$@"

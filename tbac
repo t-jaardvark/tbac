@@ -1,0 +1,75 @@
+#!/bin/bash
+
+# Function to print usage
+print_usage() {
+    echo "Usage: $0 [-i] <target_directory> <output_file> [key_file]"
+    echo "  -i: Interactive mode"
+    echo "  <target_directory>: Directory to backup"
+    echo "  <output_file>: Output file name (including path)"
+    echo "  [key_file]: Path to the key file (optional)"
+    echo "              If not provided, defaults to $HOME/.config/tbackup/key"
+}
+
+# Function to generate a key
+generate_key() {
+    local key_file="$1"
+    local key_dir=$(dirname "$key_file")
+    mkdir -p "$key_dir"
+    dd if=/dev/urandom bs=32 count=1 2>/dev/null | base64 > "$key_file"
+    echo "Generated new key at $key_file"
+}
+
+# Interactive mode function
+interactive_mode() {
+    read -p "Enter the target directory to backup: " target_dir
+    read -p "Enter the output file name (including path): " output_file
+    read -p "Enter the key file path (press Enter for default): " key_file
+
+    if [ -z "$key_file" ]; then
+        key_file="$HOME/.config/tbackup/key"
+        echo "Using default key file: $key_file"
+    fi
+}
+
+# Check for interactive mode
+if [ "$1" = "-i" ]; then
+    interactive_mode
+    shift
+elif [ $# -lt 2 ]; then
+    print_usage
+    exit 1
+else
+    target_dir="$1"
+    output_file="$2"
+    default_key_file="$HOME/.config/tbackup/key"
+
+    # If third argument is provided, use it as key_file, otherwise use default
+    if [ $# -eq 3 ]; then
+        key_file="$3"
+    else
+        key_file="$default_key_file"
+        echo "Using default key file: $key_file"
+    fi
+fi
+
+# Check if target directory exists
+if [ ! -d "$target_dir" ]; then
+    echo "Error: Target directory does not exist."
+    exit 1
+fi
+
+# Check if key file exists, if not, generate it
+if [ ! -f "$key_file" ]; then
+    echo "Warning: Key file does not exist at $key_file"
+    generate_key "$key_file"
+fi
+
+# Perform the backup
+echo "Performing backup..."
+tar -cf - "$target_dir" | zstd -c | gpg --passphrase-file "$key_file" --batch --yes -c --pinentry-mode loopback > "$output_file"
+
+# Save a copy of the key next to the output file
+output_key="${output_file}.key"
+cp "$key_file" "$output_key"
+
+echo "Backup completed. Key file copied to $output_key"

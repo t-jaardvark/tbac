@@ -1,0 +1,70 @@
+#!/bin/bash
+
+CONFIG_FILE="$HOME/.config/tbac/tbac_ssh.env"
+CONFIG_DIR=$(dirname "$CONFIG_FILE")
+
+# Function to prompt for a variable and append it to the config file
+prompt_and_save() {
+    local var_name=$1
+    local var_description=$2
+    local var_value
+
+    read -p "Enter $var_description: " var_value
+    echo "$var_name=\"$var_value\"" >> "$CONFIG_FILE"
+    eval "$var_name=\"$var_value\""
+}
+
+# Create config directory if it doesn't exist
+mkdir -p "$CONFIG_DIR"
+
+# Check if config file exists, create it if not
+if [ ! -f "$CONFIG_FILE" ]; then
+    touch "$CONFIG_FILE"
+    echo "Created new config file: $CONFIG_FILE"
+fi
+
+# Source the config file
+source "$CONFIG_FILE"
+
+# Check for required variables and prompt if missing
+if [ -z "$BACKUP_DIR" ]; then
+    prompt_and_save "BACKUP_DIR" "backup directory path"
+fi
+
+SSH_BACKUP_DIR="$BACKUP_DIR/ssh.d"
+SSH_DIR="$HOME/.ssh"
+
+backup_ssh() {
+    rm -rf "$SSH_BACKUP_DIR"
+    mkdir -p "$SSH_BACKUP_DIR"
+    TMP_SSH_DIR=$(mktemp -d)
+    cp -LR "$SSH_DIR/"* "$TMP_SSH_DIR"
+    cp -r "$TMP_SSH_DIR" "$SSH_BACKUP_DIR/ssh"
+    rm -rf "$TMP_SSH_DIR"
+    echo "SSH keys and config backed up to $SSH_BACKUP_DIR/ssh"
+}
+
+restore_ssh() {
+    if [ ! -d "$SSH_BACKUP_DIR/ssh" ]; then
+        echo "SSH backup directory not found!"
+        return 1
+    fi
+    mkdir -p "$SSH_DIR"
+    cp -r "$SSH_BACKUP_DIR/ssh/"* "$SSH_DIR"
+    chmod 700 "$SSH_DIR"
+    find "$SSH_DIR" -type f -exec chmod 600 {} \;
+    echo "SSH keys and config restored from $SSH_BACKUP_DIR/ssh"
+}
+
+case "$1" in
+    backup)
+        backup_ssh
+        ;;
+    restore)
+        restore_ssh
+        ;;
+    *)
+        echo "Usage: $0 {backup|restore}"
+        exit 1
+        ;;
+esac

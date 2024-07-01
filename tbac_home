@@ -1,0 +1,210 @@
+#!/bin/bash
+
+# Define colors for output
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+RED='\033[0;31m'
+NC='\033[0m'  # No Color
+
+# Setup the configuration directory
+CONFIG_DIR="$HOME/.config/tbac"
+mkdir -p "$CONFIG_DIR"
+KEYFILE="$CONFIG_DIR/static.key"
+OPTIONS_FILE="$CONFIG_DIR/tbac_home.env"
+
+# Function to check and install dependencies
+check_dependencies() {
+    local dependencies=("zstd" "tar" "gpg" "fzf")
+    local package_manager
+
+    # Determine the package manager
+    if command -v dnf &> /dev/null; then
+        package_manager="dnf"
+    elif command -v apt-get &> /dev/null; then
+        package_manager="apt-get"
+    elif command -v pacman &> /dev/null; then
+        package_manager="pacman"
+    else
+        echo -e "${RED}No supported package manager found.${NC}"
+        exit 1
+    fi
+
+    # Install missing dependencies
+    for dep in "${dependencies[@]}"; do
+        if ! command -v "$dep" &> /dev/null; then
+            echo -e "${YELLOW}Installing $dep using $package_manager...${NC}"
+            sudo "$package_manager" install -y "$dep"
+        fi
+    done
+}
+
+# Load or create configuration
+setup_configuration() {
+    if [ -f "$OPTIONS_FILE" ]; then
+        echo -e "${GREEN}Loading configuration...${NC}"
+        source "$OPTIONS_FILE"
+        if [ -z "$OUTPUT_DIR" ] || [ -z "$RESTORE_DIR" ]; then
+            echo -e "${RED}Configuration file is corrupted or incomplete. Recreating configuration...${NC}"
+            create_configuration
+        fi
+    else
+        echo -e "${RED}Configuration file not found. Creating a new one...${NC}"
+        create_configuration
+    fi
+}
+
+# Create a new configuration file
+create_configuration() {
+    echo 'TIMESTAMP=$(date +"%Y.%m.%d")' > "$OPTIONS_FILE"
+    local backup_dir
+    local restore_dir
+
+    read -p "Enter the path you want the backup file to be stored: " backup_dir
+    echo "OUTPUT_DIR='$backup_dir'" >> "$OPTIONS_FILE"
+
+    read -p "Enter the path for restoring or extracting backups (Default: $HOME/.cache): " restore_dir
+    restore_dir=${restore_dir:-$HOME/.cache/tbac_home}
+    echo "RESTORE_DIR='$restore_dir'" >> "$OPTIONS_FILE"
+
+    echo -e "${GREEN}Configuration file created at $OPTIONS_FILE${NC}"
+}
+
+# Set up tar filters
+setup_filters() {
+    local filters_file="$CONFIG_DIR/tbac_home_filter"
+    if [ ! -f "$filters_file" ]; then
+        echo -e "${YELLOW}Setting up filters for tar...${NC}"
+        touch "$filters_file"
+        echo -e "${GREEN}Filters file created at $filters_file${NC}"
+        declare -A default_excludes=(
+            ["$HOME/.cargo"]="Rust package manager cache"
+            ["$HOME/.rustup"]="Rust toolchain cache"
+            ["$HOME/.cache"]="General cache directory"
+            ["$HOME/.local/Trash"]="Trash directory"
+            ["$HOME/.steam"]="Steam game files"
+            ["$HOME/Downloads"]="Downloads directory"
+            ["$HOME/sync"]="Sync directory"
+            ["$HOME/VMs"]="Virtual machines directory"
+            ["$HOME/Nextcloud"]="Nextcloud directory"
+            ["$HOME/Dropbox"]="Dropbox directory"
+        )
+
+        for dir in "${!default_excludes[@]}"; do
+            read -p "Exclude ${dir} (${default_excludes[$dir]})? (Y/n): " exclude
+            exclude=${exclude:-y}  # Default to 'y' if no input is given
+            if [[ "$exclude" =~ ^[Yy]$ ]]; then
+                echo "$dir" >> "$filters_file"
+            fi
+        done
+    fi
+}
+
+# Generate password file if it does not exist
+generate_password_file() {
+    if [ ! -f "$KEYFILE" ]; then
+        head -c 32 /dev/urandom | tr -dc 'a-zA-Z0-9' > "$KEYFILE"
+        chmod 600 "$KEYFILE"
+        echo -e "${GREEN}Password file generated at '$KEYFILE'.${NC}"
+    elif [ ! -r "$KEYFILE" ] || [ ! -w "$KEYFILE" ]; then
+        echo -e "${RED}Password file at '$KEYFILE' cannot be read or written to. Check permissions or recreate key file.${NC}"
+        exit 1
+    fi
+}
+
+# Cleanup function to handle interruptions
+cleanup_on_interrupt() {
+    if [ "$backup_complete" = false ]; then
+        rm -f "$OUTPUT_DIR/$OUTPUT_FILE"
+        echo -e "${RED}Backup process interrupted. Backup file deleted.${NC}"
+    fi
+    exit 1
+}
+
+perform_backup() {
+    local exclude_file="$CONFIG_DIR/tbac_home_filter"
+    local backup_complete=false
+    local verbose_flag=""
+
+    # Check for verbose flag
+    if [ "$1" = "-v" ]; then
+        verbose_flag="v"
+    fi
+
+    # Ensure the backup filename is unique
+    local i=1
+    local OUTPUT_FILE="home_${TIMESTAMP}_${USER}_${HOSTNAME}_$(printf "%03d" $i).tar.zst.gpg"
+    while [ -e "$OUTPUT_DIR/$OUTPUT_FILE" ]; do
+        i=$((i+1))
+        OUTPUT_FILE="home_${TIMESTAMP}_${USER}_${HOSTNAME}_$(printf "%03d" $i).tar.zst.gpg"
+    done
+
+    echo -e "${YELLOW}Target backup file: $OUTPUT_FILE${NC}"
+
+    if [ ! -w "$OUTPUT_DIR" ]; then
+        echo -e "${RED}Cannot write to output directory '$OUTPUT_DIR'. Check permissions or path.${NC}"
+        exit 1
+    fi
+
+    trap 'cleanup_on_interrupt' INT TERM HUP EXIT
+
+    echo -e "${YELLOW}Backing up home directory and encrypting backup...${NC}"
+    tar --exclude-from="$exclude_file" -c${verbose_flag}f - "$HOME" | zstd -c | gpg --passphrase-file "$KEYFILE" --batch --yes -c --pinentry-mode loopback > "$OUTPUT_DIR/$OUTPUT_FILE" && backup_complete=true
+
+    if [ "$backup_complete" = true ]; then
+        cp "$KEYFILE" "${OUTPUT_DIR}/${OUTPUT_FILE}.key" && echo -e "Keyfile copied to ${OUTPUT_DIR}/${OUTPUT_FILE}.key"
+        echo -e "${GREEN}Backup created at '$OUTPUT_DIR/$OUTPUT_FILE'.${NC}"
+    fi
+}
+
+# Select and restore a backup file interactively using fzf
+select_and_restore_backup() {
+    echo -e "${YELLOW}Select a backup file to restore:${NC}"
+    local selected_backup=$(find "$OUTPUT_DIR" -type f -name '*.tar.zst.gpg' | fzf)
+    if [ -n "$selected_backup" ]; then
+        echo -e "${GREEN}You selected: $selected_backup${NC}"
+        local restore_choice
+        echo -e "${YELLOW}Do you want to restore the backup directly to HOME or extract it to a cache folder? [r]estore / [e]xtract:${NC}"
+        read -p "(Default is restore): " restore_choice
+        restore_choice=${restore_choice:-r}
+
+        if [[ "$restore_choice" == "e" ]]; then
+            local cache_dir="$RESTORE_DIR/$(basename "$selected_backup" .tar.zst.gpg)"
+            rm -rf "$cache_dir" && mkdir -p "$cache_dir"
+            echo -e "${YELLOW}Extracting backup to $cache_dir...${NC}"
+            gpg --passphrase-file "$KEYFILE" --batch --yes -d "$selected_backup" | zstd -d | tar -xf - -C "$cache_dir"
+            echo -e "${GREEN}Backup extracted to $cache_dir.${NC}"
+        else
+            echo -e "${YELLOW}Restoring backup to HOME directory...${NC}"
+            gpg --passphrase-file "$KEYFILE" --batch --yes -d "$selected_backup" | zstd -d | tar --strip-components=2 -xf - -C "$HOME"
+            echo -e "${GREEN}Backup restored successfully to HOME directory.${NC}"
+        fi
+    else
+        echo -e "${RED}No backup file selected.${NC}"
+    fi
+}
+
+# Main execution logic
+main() {
+    if [ "$1" == "-r" ]; then
+        setup_configuration
+        select_and_restore_backup
+        exit 0
+    fi
+
+    check_dependencies
+    setup_configuration
+    generate_password_file
+    setup_filters
+
+    perform_backup "$1"
+
+    # Display the contents of the backup directory
+    if command -v exa &> /dev/null; then
+        exa -la --color=always --group-directories-first "$OUTPUT_DIR"
+    else
+        ls -lah "$OUTPUT_DIR"
+    fi
+}
+
+# Call the main function to execute the script
+main "$@"
