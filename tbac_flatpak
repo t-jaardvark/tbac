@@ -1,0 +1,63 @@
+#!/bin/bash
+
+# Color codes for messages
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+NC='\033[0m' # No Color
+
+# Configuration file location
+CONFIG_DIR="$HOME/.config/tbac"
+CONFIG_FILE="$CONFIG_DIR/tbac_flatpak.env"
+FLATPAK_LIST_FILE="flatpak_list.txt"
+
+# Function to load or initialize the configuration
+load_or_init_config() {
+    if [[ ! -d "$CONFIG_DIR" ]]; then
+        mkdir -p "$CONFIG_DIR"
+    fi
+
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        read -p "Configuration file not found. Please enter the directory to store the Flatpak list: " FLATPAK_DIR
+        echo "FLATPAK_DIR=$FLATPAK_DIR" > "$CONFIG_FILE"
+    fi
+
+    source "$CONFIG_FILE"
+}
+
+# Function to dump explicitly installed Flatpaks
+dump_flatpaks() {
+    load_or_init_config
+    flatpak list --app --columns=application > "$FLATPAK_DIR/$FLATPAK_LIST_FILE"
+    echo -e "${GREEN}Explicitly installed Flatpaks have been dumped to $FLATPAK_DIR/$FLATPAK_LIST_FILE${NC}"
+}
+
+# Function to restore Flatpaks from the dump file
+restore_flatpaks() {
+    load_or_init_config
+
+    if [[ ! -f "$FLATPAK_DIR/$FLATPAK_LIST_FILE" ]]; then
+        echo -e "${RED}Error: $FLATPAK_DIR/$FLATPAK_LIST_FILE not found!${NC}"
+        exit 1
+    fi
+
+    while IFS= read -r app; do
+        flatpak install -y "$app"
+    done < "$FLATPAK_DIR/$FLATPAK_LIST_FILE"
+
+    echo -e "${GREEN}Flatpaks have been restored from $FLATPAK_DIR/$FLATPAK_LIST_FILE${NC}"
+}
+
+# Main script logic
+case "$1" in
+    dump)
+        dump_flatpaks
+        ;;
+    restore)
+        restore_flatpaks
+        ;;
+    *)
+        echo -e "${YELLOW}Usage: $0 {dump|restore}${NC}"
+        exit 1
+        ;;
+esac
