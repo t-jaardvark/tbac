@@ -1,0 +1,13 @@
+#!/bin/bash
+
+# Backup directory
+BACKUP_DIR="$HOME/.config/tbac"
+mkdir -p "$BACKUP_DIR"
+
+# Filename for the backup
+BACKUP_FILE="$BACKUP_DIR/tbac_apt.txt"
+
+# Get the list of manually installed packages
+apt-mark showmanual > "$BACKUP_FILE"
+
+echo "Backup of manually installed packages is saved to $BACKUP_FILE"
