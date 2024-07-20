@@ -1,45 +1,206 @@
 #!/bin/bash
+# Color codes
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+NC='\033[0m' # No Color
 
-BACKUP_FILE="/1/tjh/backups/arch-ghost/bac.d/bac_smb"
+echo -e "${YELLOW}WARNING: backups from this tool are unencrypted${NC}"
+
+# Environment file
+ENV_FILE="$HOME/.config/tbac/tbac_smb.env"
+
+# Function to create .env file with comments
+create_env_file() {
+    mkdir -p "$(dirname "$ENV_FILE")"
+    cat > "$ENV_FILE" <<EOL
+# SMB Script Configuration
+
+# CIFS backup file path
+BACKUP_LOCAL="\$HOME/.config/tbac/tbac_smb"
+
+# CIFS backup file path 2
+BACKUP_SMB="/mnt/smb/node/backup/tbac_smb"
+
+# CIFS backup file path 3 (optional)
+BACKUP_OTHER=""
+
+# SMB credentials file path
+CREDENTIALS_FILE="/etc/smb_credentials"
+EOL
+    echo -e "${GREEN}.env file created at $ENV_FILE. Please fill in the required values.${NC}"
+}
+
+# Function to load .env file
+load_env_file() {
+    if [ -f "$ENV_FILE" ]; then
+        set -a
+        source "$ENV_FILE"
+        set +a
+    else
+        create_env_file
+        exit 1
+    fi
+}
+
+# Load environment variables
+load_env_file
+
+# Check required environment variables
+check_env_vars() {
+    local missing_vars=()
+    for var in "$@"; do
+        if [ "$var" != "BACKUP_OTHER" ] && [ "$var" != "BACKUP_SMB" ] && [ -z "${!var}" ]; then
+            missing_vars+=("$var")
+        fi
+    done
+    if [ ${#missing_vars[@]} -ne 0 ]; then
+        echo -e "${RED}Missing required environment variables: ${missing_vars[*]}. Please set them in $ENV_FILE.${NC}"
+        exit 1
+    fi
+}
 
 backup_cifs_mounts() {
-    grep -E "cifs.*nofail" /etc/fstab > "$BACKUP_FILE"
-    echo "CIFS mounts with 'nofail' option backed up to $BACKUP_FILE"
+    check_env_vars BACKUP_LOCAL
+
+    local valid_targets=()
+    for target in "$BACKUP_LOCAL" "$BACKUP_SMB" "$BACKUP_OTHER"; do
+        if [ -n "$target" ]; then
+            valid_targets+=("$target")
+        else
+            echo -e "${YELLOW}Skipping empty backup target.${NC}"
+        fi
+    done
+
+    if [ ${#valid_targets[@]} -eq 0 ]; then
+        echo -e "${RED}No valid backup targets specified. Aborting.${NC}"
+        exit 1
+    fi
+
+    for target in "${valid_targets[@]}"; do
+        if [ ! -d "$(dirname "$target")" ]; then
+            if mkdir -p "$(dirname "$target")"; then
+                echo -e "${GREEN}Created backup directory: $(dirname "$target")${NC}"
+            else
+                echo -e "${RED}Failed to create backup directory: $(dirname "$target")${NC}"
+                exit 1
+            fi
+        else
+            echo -e "${YELLOW}Backup directory already exists: $(dirname "$target")${NC}"
+        fi
+    done
+
+    if grep -E "cifs.*nofail" /etc/fstab | tee "${valid_targets[@]}" > /dev/null; then
+        echo -e "${GREEN}CIFS mounts with 'nofail' option backed up to:${NC}"
+        for target in "${valid_targets[@]}"; do
+            echo "- $target"
+        done
+    else
+        echo -e "${YELLOW}No CIFS mounts with 'nofail' option found in /etc/fstab.${NC}"
+    fi
 }
 
 restore_cifs_mounts() {
-    if [ ! -f "$BACKUP_FILE" ]; then
-        echo "Backup file not found: $BACKUP_FILE"
+    check_env_vars BACKUP_LOCAL BACKUP_SMB CREDENTIALS_FILE
+
+    # Choose the newest backup file
+    NEWER_FILE=$(find "$BACKUP_LOCAL" "$BACKUP_SMB" "$BACKUP_OTHER" -type f -printf "%T@ %p\n" 2>/dev/null | sort -n | tail -1 | cut -d' ' -f2)
+
+    if [ -z "$NEWER_FILE" ]; then
+        echo -e "${RED}No backup files found. Aborting restoration.${NC}"
         exit 1
     fi
+
+    echo -e "${GREEN}Restoring from $NEWER_FILE${NC}"
 
     # Check and install dependencies
     if [ -f /etc/arch-release ]; then
+        echo -e "${YELLOW}Arch Linux detected. Installing cifs-utils...${NC}"
         sudo pacman -S --needed cifs-utils
     elif [ -f /etc/debian_version ]; then
+        echo -e "${YELLOW}Debian-based system detected. Installing cifs-utils...${NC}"
         sudo apt-get update
         sudo apt-get install -y cifs-utils
     elif [ -f /etc/fedora-release ]; then
+        echo -e "${YELLOW}Fedora detected. Installing cifs-utils...${NC}"
         sudo dnf install -y cifs-utils
     else
-        echo "Unsupported distribution. Please install CIFS utilities manually."
+        echo -e "${RED}Unsupported distribution. Please install CIFS utilities manually.${NC}"
         exit 1
     fi
 
-    # Append backed up mounts to /etc/fstab
-    cat "$BACKUP_FILE" >> /etc/fstab
-    echo "CIFS mounts restored to /etc/fstab"
+    # Create mount directories and append backed up mounts to /etc/fstab
+    while IFS= read -r line; do
+        mount_point=$(echo "$line" | awk '{print $2}')
+        if sudo mkdir -p "$mount_point"; then
+            echo -e "${GREEN}Created mount directory: $mount_point${NC}"
+        else
+            echo -e "${RED}Failed to create mount directory: $mount_point${NC}"
+        fi
+        if echo "$line" | sudo tee -a /etc/fstab > /dev/null; then
+            echo -e "${GREEN}Added to /etc/fstab: $line${NC}"
+        else
+            echo -e "${RED}Failed to add to /etc/fstab: $line${NC}"
+        fi
+    done < "$NEWER_FILE"
+
+    echo -e "${GREEN}CIFS mounts restoration complete.${NC}"
+}
+
+add_smb_share() {
+    check_env_vars CREDENTIALS_FILE
+
+    echo -e "${YELLOW}Adding a new SMB share...${NC}"
+
+    # Prompt for share details
+    read -p "Enter SMB server IP: " server_ip
+    read -p "Enter share name: " share_name
+    read -p "Enter mount point (e.g., /mnt/myshare): " mount_point
+    read -s -p "Enter password: " password
+    echo
+
+    # Create mount point
+    if sudo mkdir -p "$mount_point"; then
+        echo -e "${GREEN}Created mount point: $mount_point${NC}"
+    else
+        echo -e "${RED}Failed to create mount point: $mount_point${NC}"
+        return 1
+    fi
+
+    # Add or update credentials
+    if [ ! -f "$CREDENTIALS_FILE" ]; then
+        echo "username=$username" | sudo tee "$CREDENTIALS_FILE" > /dev/null
+        echo "password=$password" | sudo tee -a "$CREDENTIALS_FILE" > /dev/null
+        sudo chmod 600 "$CREDENTIALS_FILE"
+        echo -e "${GREEN}Created credentials file: $CREDENTIALS_FILE${NC}"
+    else
+        echo -e "${YELLOW}Credentials file already exists. Updating...${NC}"
+        sudo sed -i "s/^username=.*/username=$username/" "$CREDENTIALS_FILE"
+        sudo sed -i "s/^password=.*/password=$password/" "$CREDENTIALS_FILE"
+        echo -e "${GREEN}Updated credentials in $CREDENTIALS_FILE${NC}"
+    fi
+
+    # Add entry to fstab
+    fstab_entry="//$server_ip/$share_name $mount_point cifs credentials=$CREDENTIALS_FILE,uid=1000,gid=1000,file_mode=0777,dir_mode=0777,nofail 0 0"
+    echo "$fstab_entry" | sudo tee -a /etc/fstab > /dev/null
+    echo -e "${GREEN}Added new entry to /etc/fstab${NC}"
+
+    echo -e "${GREEN}SMB share added successfully. You can now mount it with 'sudo mount -a'${NC}"
 }
 
 case "$1" in
-    backup)
-        backup_cifs_mounts
-        ;;
-    restore)
+    -r|--restore)
         restore_cifs_mounts
         ;;
+    -a|--add)
+        add_smb_share
+        ;;
+    -b|--backup|"")
+        backup_cifs_mounts
+        ;;
     *)
-        echo "Usage: $0 {backup|restore}"
+        echo -e "${RED}Usage: $0 {-b|--backup|-r|--restore|-a|--add}${NC}"
         exit 1
         ;;
 esac
+

@@ -9,17 +9,17 @@ NC='\033[0m' # No Color
 # Configuration file location
 CONFIG_DIR="$HOME/.config/tbac"
 CONFIG_FILE="$CONFIG_DIR/tbac_flatpak.env"
-FLATPAK_LIST_FILE="flatpak_list.txt"
 
-# Function to load or initialize the configuration
-load_or_init_config() {
+# Function to load or initialize the environment configuration
+load_env() {
     if [[ ! -d "$CONFIG_DIR" ]]; then
         mkdir -p "$CONFIG_DIR"
     fi
 
     if [[ ! -f "$CONFIG_FILE" ]]; then
-        read -p "Configuration file not found. Please enter the directory to store the Flatpak list: " FLATPAK_DIR
-        echo "FLATPAK_DIR=$FLATPAK_DIR" > "$CONFIG_FILE"
+        echo "DUMP_FILES=('/1/tjh/backups/linux/state.d/tbac_flatpak/flatpak_list.txt' '$HOME/.config/tbac/tbac_flatpak/flatpak_list.txt')" > "$CONFIG_FILE"
+        echo -e "${YELLOW}Configuration file created at $CONFIG_FILE. Please customize the settings and rerun the script.${NC}"
+        exit 0
     fi
 
     source "$CONFIG_FILE"
@@ -27,14 +27,18 @@ load_or_init_config() {
 
 # Function to dump explicitly installed Flatpaks
 dump_flatpaks() {
-    load_or_init_config
-    flatpak list --app --columns=application > "$FLATPAK_DIR/$FLATPAK_LIST_FILE"
-    echo -e "${GREEN}Explicitly installed Flatpaks have been dumped to $FLATPAK_DIR/$FLATPAK_LIST_FILE${NC}"
+    load_env
+    for file in ${DUMP_FILES[@]}; do
+        dir=$(dirname "$file")
+        mkdir -p "$dir"
+        flatpak list --app --columns=application > "$file"
+        echo -e "${GREEN}Explicitly installed Flatpaks have been dumped to $file${NC}"
+    done
 }
 
 # Function to restore Flatpaks from the dump file
 restore_flatpaks() {
-    load_or_init_config
+    load_env
 
     if [[ ! -f "$FLATPAK_DIR/$FLATPAK_LIST_FILE" ]]; then
         echo -e "${RED}Error: $FLATPAK_DIR/$FLATPAK_LIST_FILE not found!${NC}"
@@ -57,7 +61,6 @@ case "$1" in
         restore_flatpaks
         ;;
     *)
-        echo -e "${YELLOW}Usage: $0 {dump|restore}${NC}"
-        exit 1
+        dump_flatpaks
         ;;
 esac
