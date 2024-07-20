@@ -87,6 +87,7 @@ setup_filters() {
             ["$HOME/VMs"]="Virtual machines directory"
             ["$HOME/Nextcloud"]="Nextcloud directory"
             ["$HOME/Dropbox"]="Dropbox directory"
+            ["$HOME/.local/share/normic.ai/GPT4All"]="GPT4All Models"
         )
 
         for dir in "${!default_excludes[@]}"; do
